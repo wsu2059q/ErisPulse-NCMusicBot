@@ -1,725 +1,419 @@
-import os
-import json
+import re
 import asyncio
 import aiohttp
-import re
-from typing import Dict, Any, List
+from typing import List, Optional
 from datetime import datetime
 
 from ErisPulse import sdk
 from ErisPulse.Core.Bases import BaseModule
-from ErisPulse.Core.Event import message, notice, request
+from ErisPulse.Core.Event import command
 
-# Search API
-# Search API
-SEARCH_API = "http://localhost:3000/search"
-SONG_URL_API = "http://localhost:3000/song/url/v1"
-SONG_DETAIL_API = "http://localhost:3000/song/detail"
-COMMENT_MUSIC_API = "http://localhost:3000/comment/music"
-PLAYLIST_DETAIL_API = "http://localhost:3000/playlist/detail"
-PLAYLIST_TRACK_ALL_API = "http://localhost:3000/playlist/track/all"
 
 class Main(BaseModule):
-    # User session state: user_id -> { "songs": [...], "state": "selecting" }
-    user_sessions: Dict[str, Dict[str, Any]] = {}
-    _session_counter: int = 0
+    def __init__(self):
+        self.sdk = sdk
+        self.logger = sdk.logger.get_child("MusicBot")
+        self._config = self._load_config()
+        self._session: Optional[aiohttp.ClientSession] = None
 
     @staticmethod
-    def _session_key(event: Dict[str, Any], user_id: str) -> str:
-        platform = event.get("platform") or "yunhu"
-        detail_type = "group" if event.get("group_id") else "user"
-        target_id = event.get("group_id") or user_id
-        return f"{platform}:{detail_type}:{target_id}:{user_id}"
+    def get_load_strategy():
+        from ErisPulse.loaders import ModuleLoadStrategy
+        return ModuleLoadStrategy(lazy_load=False, priority=10)
 
-    async def _cancel_session(self, session_key: str):
-        session = Main.user_sessions.pop(session_key, None)
-        if not session:
-            return
+    def _load_config(self) -> dict:
+        config = self.sdk.config.getConfig("MusicBot")
+        if not config:
+            default = {
+                "api_base_url": "http://localhost:3000",
+                "search_limit": 30,
+            }
+            self.sdk.config.setConfig("MusicBot", default)
+            self.logger.warning("已创建默认配置，请根据需要修改 config.toml 中的 [MusicBot] 段")
+            return default
+        return config
 
-    def _schedule_session_timeout(self, session_key: str, session_id: int, timeout_s: float = 3000.0):
+    @property
+    def _base_url(self) -> str:
+        return self._config.get("api_base_url", "http://localhost:3000").rstrip("/")
+
+    @property
+    def _search_limit(self) -> int:
+        return int(self._config.get("search_limit", 30))
+
+    async def on_load(self, event):
+        self._session = aiohttp.ClientSession()
+
+        @command("music", aliases=["点歌", "音乐"], help="搜索并点歌")
+        async def music_cmd(evt):
+            await self._handle_music(evt)
+
+        @command("playlist", aliases=["歌单"], help="搜索歌单")
+        async def playlist_cmd(evt):
+            await self._handle_playlist(evt)
+
+        self.logger.info("MusicBot 模块已加载")
+
+    async def on_unload(self, event):
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self.logger.info("MusicBot 模块已卸载")
+
+    async def _request(self, path: str, params: dict = None) -> Optional[dict]:
+        url = f"{self._base_url}{path}"
+        try:
+            async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    self.logger.error(f"API 请求失败: {url} status={resp.status}")
+                    return None
+                return await resp.json()
+        except asyncio.TimeoutError:
+            self.logger.error(f"API 请求超时: {url}")
+            return None
+        except aiohttp.ClientError as e:
+            self.logger.error(f"API 请求错误: {e}")
+            return None
+
+    async def _search_songs(self, keywords: str, limit: int = None, offset: int = 0) -> List[dict]:
+        data = await self._request("/search", {
+            "keywords": keywords,
+            "limit": limit or self._search_limit,
+            "offset": offset,
+        })
+        if data and data.get("code") == 200:
+            return data.get("result", {}).get("songs", [])
+        return []
+
+    async def _search_playlists(self, keywords: str, limit: int = None, offset: int = 0) -> List[dict]:
+        data = await self._request("/search", {
+            "keywords": keywords,
+            "limit": limit or self._search_limit,
+            "offset": offset,
+            "type": 1000,
+        })
+        if data and data.get("code") == 200:
+            return data.get("result", {}).get("playlists", [])
+        return []
+
+    async def _get_song_url(self, song_id: int) -> Optional[str]:
+        data = await self._request("/song/url/v1", {"id": song_id, "level": "exhigh"})
+        if data and data.get("code") == 200:
+            songs = data.get("data", [])
+            if songs:
+                return songs[0].get("url")
         return None
 
-    async def on_load(self, event) -> bool:
-        sdk.logger.info(f"MusicBot module loaded from: {__file__}")
-        # Register for message events to catch commands
-        sdk.adapter.on("message")(self.handle_any_event)
-        sdk.adapter.on("message")(self.handle_message)
-        return True
+    async def _get_song_detail(self, song_id: int) -> dict:
+        data = await self._request("/song/detail", {"ids": song_id})
+        if data and data.get("code") == 200:
+            songs = data.get("songs", [])
+            return songs[0] if songs else {}
+        return {}
+
+    async def _get_comment_total(self, song_id: int) -> int:
+        data = await self._request("/comment/music", {"id": song_id, "limit": 1})
+        if data:
+            total = data.get("total")
+            if isinstance(total, int):
+                return total
+        return 0
+
+    async def _get_playlist_detail(self, playlist_id: int) -> dict:
+        data = await self._request("/playlist/detail", {"id": playlist_id})
+        if data and data.get("code") == 200:
+            return data.get("playlist", {})
+        return {}
+
+    async def _get_playlist_tracks(self, playlist_id: int, limit: int = None, offset: int = 0) -> List[dict]:
+        data = await self._request("/playlist/track/all", {
+            "id": playlist_id,
+            "limit": limit or self._search_limit,
+            "offset": offset,
+        })
+        if data:
+            songs = data.get("songs")
+            if isinstance(songs, list):
+                return songs
+        return []
 
     @staticmethod
-    def should_eager_load() -> bool:
-        return True
+    def _format_artist_names(artists) -> str:
+        if not artists:
+            return "未知"
+        return "/".join(a.get("name", "") for a in artists if isinstance(a, dict))
+
+    def _format_song_list(self, songs: List[dict], page: int) -> str:
+        lines = [f"共 {len(songs)} 条结果（第 {page} 页），请回复数字选择歌曲"]
+        for i, song in enumerate(songs, 1):
+            name = song.get("name", "未知")
+            artists = song.get("artists") or song.get("ar") or []
+            lines.append(f"{i}. {name} - {self._format_artist_names(artists)}")
+        lines.append("\n回复 \"列表 N\" 翻页")
+        return "\n".join(lines)
+
+    def _format_playlist_list(self, playlists: List[dict], page: int) -> str:
+        lines = [f"共 {len(playlists)} 条结果（第 {page} 页），请回复数字选择歌单"]
+        for i, pl in enumerate(playlists, 1):
+            name = pl.get("name", "未知")
+            creator = pl.get("creator") or {}
+            nickname = creator.get("nickname", "") if isinstance(creator, dict) else ""
+            count = pl.get("trackCount")
+            count_str = f" ({count}首)" if isinstance(count, int) else ""
+            lines.append(f"{i}. {name} - {nickname}{count_str}")
+        lines.append("\n回复 \"列表 N\" 翻页")
+        return "\n".join(lines)
+
+    async def _format_song_detail(self, song_id: int, basic: dict = None) -> str:
+        detail = await self._get_song_detail(song_id)
+        if not detail:
+            detail = basic or {}
+        comment_total = await self._get_comment_total(song_id)
+
+        name = detail.get("name", "")
+        main_title = detail.get("mainTitle", "")
+        artists = detail.get("ar") or detail.get("artists") or []
+        album = detail.get("al") or detail.get("album") or {}
+        album_name = album.get("name", "") if isinstance(album, dict) else ""
+        cover_url = album.get("picUrl", "") if isinstance(album, dict) else ""
+        pop = detail.get("pop")
+        pop_str = str(int(pop)) if isinstance(pop, (int, float)) else ""
+
+        lines = [f"歌名：{name}"]
+        if main_title:
+            lines.append(f"主标题：{main_title}")
+        lines.append(f"歌手：{self._format_artist_names(artists)}")
+        if album_name:
+            lines.append(f"专辑：{album_name}")
+        if pop_str:
+            lines.append(f"热度：{pop_str}")
+        lines.append(f"评论数：{comment_total}")
+        if cover_url:
+            lines.append(f"封面：{cover_url}")
+        return "\n".join(lines)
 
     @staticmethod
-    async def get_search_results(keywords: str, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SEARCH_API, params={"keywords": keywords, "limit": limit, "offset": offset}) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                # Adapting to the structure in netease-api-req.txt
-                # { "result": { "songs": [ ... ] }, "code": 200 }
-                if data.get("code") == 200 and "result" in data and "songs" in data["result"]:
-                    return data["result"]["songs"]
-                return []
+    def _format_playlist_detail(detail: dict) -> str:
+        name = detail.get("name", "")
+        creator = detail.get("creator") or {}
+        nickname = creator.get("nickname", "") if isinstance(creator, dict) else ""
+        create_time = detail.get("createTime")
+        create_str = ""
+        if create_time:
+            try:
+                create_str = datetime.fromtimestamp(int(create_time) / 1000).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+        cover_url = detail.get("coverImgUrl", "")
 
-    @staticmethod
-    async def get_playlist_search_results(keywords: str, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                SEARCH_API,
-                params={"keywords": keywords, "limit": limit, "offset": offset, "type": 1000},
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                if data.get("code") == 200 and "result" in data and "playlists" in data["result"]:
-                    return data["result"]["playlists"]
-                return []
+        lines = [f"歌单：{name}", f"创建者：{nickname}"]
+        if create_str:
+            lines.append(f"创建时间：{create_str}")
+        if cover_url:
+            lines.append(f"封面：{cover_url}")
+        lines.append("\n回复 Y 查看歌单内歌曲，N 取消")
+        return "\n".join(lines)
 
-    @staticmethod
-    async def get_playlist_detail(playlist_id: int) -> Dict[str, Any]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(PLAYLIST_DETAIL_API, params={"id": playlist_id}) as resp:
-                if resp.status != 200:
-                    return {}
-                data = await resp.json()
-                if data.get("code") == 200 and isinstance(data.get("playlist"), dict):
-                    return data["playlist"]
-                return {}
+    async def _send_audio(self, event, song_id: int, song_name: str):
+        url = await self._get_song_url(song_id)
+        if not url:
+            await event.reply("获取歌曲链接失败，可能需要 VIP 或歌曲已下架")
+            return
 
-    @staticmethod
-    async def get_playlist_tracks(playlist_id: int, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                PLAYLIST_TRACK_ALL_API,
-                params={"id": playlist_id, "limit": limit, "offset": offset},
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                songs = data.get("songs")
-                if isinstance(songs, list):
-                    return songs
-                return []
-
-    @staticmethod
-    async def get_song_url(song_id: int) -> str:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SONG_URL_API, params={"id": song_id, "level": "exhigh"}) as resp:
-                if resp.status != 200:
-                    sdk.logger.error(f"API Error: {resp.status}")
-                    return None
-                data = await resp.json()
-                # Structure: { "data": [ { "url": "..." } ] }
-                if data.get("code") == 200 and "data" in data and len(data["data"]) > 0:
-                    return data["data"][0].get("url")
-                return None
-
-    @staticmethod
-    async def get_song_detail(song_id: int) -> Dict[str, Any]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(SONG_DETAIL_API, params={"ids": song_id}) as resp:
-                if resp.status != 200:
-                    return {}
-                data = await resp.json()
-                if data.get("code") == 200 and data.get("songs"):
-                    return data["songs"][0]
-                return {}
-
-    @staticmethod
-    async def get_comment_total(song_id: int) -> int:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(COMMENT_MUSIC_API, params={"id": song_id, "limit": 1}) as resp:
-                if resp.status != 200:
-                    return 0
-                data = await resp.json()
-                total = data.get("total")
-                if isinstance(total, int):
-                    return total
-                return 0
-
-    @staticmethod
-    async def generate_video_from_audio(audio_path: str, output_path: str, duration: int):
-        # 1080x720 video
+        platform = event.get_platform()
         try:
-            # Check audio file size
-            if os.path.exists(audio_path):
-                size = os.path.getsize(audio_path)
-                sdk.logger.info(f"Audio file size: {size} bytes")
-                if size == 0:
-                    raise Exception("Audio file is empty")
-            else:
-                 raise Exception("Audio file not found")
+            send_methods = self.sdk.adapter.list_sends(platform)
+        except Exception:
+            send_methods = []
 
-            # Calculate duration in seconds
-            duration_sec = str(duration / 1000.0)
-            
-            # Construct FFmpeg command
-            # ffmpeg -f lavfi -i color=c=black:s=1080x720:r=5 -t <duration> -i <audio> -c:v libx264 -c:a aac -pix_fmt yuv420p -shortest <output> -y
-            args = [
-                "ffmpeg",
-                "-f", "lavfi",
-                "-i", "color=c=black:s=540x280:r=5",
-                "-t", duration_sec,
-                "-i", audio_path,
-                "-map", "0:v",
-                "-map", "1:a",
-                "-c:v", "libx264",
-                "-c:a", "aac",
-                "-pix_fmt", "yuv420p",
-                "-shortest",
-                output_path,
-                "-y"
-            ]
-            
-            sdk.logger.info(f"Running FFmpeg command: {' '.join(args)}")
-            
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                error_msg = stderr.decode() if stderr else 'Unknown Error'
-                sdk.logger.error(f"FFmpeg failed with return code {process.returncode}: {error_msg}")
-                raise Exception(f"FFmpeg failed: {error_msg}")
+        if "Voice" in send_methods:
+            try:
+                await event.reply(url, method="Voice")
+                return
+            except Exception as e:
+                self.logger.warning(f"语音发送失败，降级为文本: {e}")
 
-            if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
-                # 50 bytes is definitely too small for a video
-                sdk.logger.error(f"Generated video is too small or missing. Stderr: {stderr.decode() if stderr else ''}")
-                raise Exception("Generated video is invalid (file too small)")
-                
-            sdk.logger.info("Video generation successful")
-            
-        except FileNotFoundError:
-             sdk.logger.error("FFmpeg executable not found. Please verify valid ffmpeg installation and ensure it is in your PATH.")
-             raise Exception("FFmpeg executable not found")
-        except Exception as e:
-            sdk.logger.error(f"Video generation error: {e}")
-            raise e
+        await event.reply(f"{song_name}\n{url}")
 
-    async def handle_message(self, event: Dict[str, Any]):
+    async def _handle_music(self, event):
         try:
-            user_id = event.get("user_id")
-            message_text = ""
-            
-            # Extract text from message chain/segments
-            if "message" in event and isinstance(event["message"], list):
-                for seg in event["message"]:
-                    if seg.get("type") == "text":
-                        message_text += seg.get("data", {}).get("text", "")
-            elif "raw_message" in event:
-                message_text = event["raw_message"]
-
-            if not user_id or not message_text:
+            args = event.get_command_args()
+            if not args:
+                await event.reply("请输入歌曲名称，例如：/music 周杰伦")
                 return
 
-            # Check if user is in selecting state
-            session_key = Main._session_key(event, user_id)
-            if session_key in Main.user_sessions:
-                session = Main.user_sessions[session_key]
-                msg = message_text.strip()
+            keywords = " ".join(args)
+            await event.reply(f"正在搜索：{keywords}...")
 
-                state = session.get("state")
-                mode = session.get("mode", "song")
+            songs = await self._search_songs(keywords)
+            if not songs:
+                await event.reply("未找到相关歌曲")
+                return
 
-                if state == "playlist_confirm_tracks":
-                    if msg.upper() == "Y":
-                        playlist_id = session.get("playlist_id")
-                        if not playlist_id:
-                            return
+            page = 1
+            offset = 0
+            while True:
+                if page > 1:
+                    songs = await self._search_songs(keywords, offset=offset)
+                    if not songs:
+                        await event.reply("没有更多结果了")
+                        break
 
-                        limit = int(session.get("limit", 30))
-                        page = 1
-                        offset = 0
-                        songs = await self.get_playlist_tracks(int(playlist_id), limit=limit, offset=offset)
+                await event.reply(self._format_song_list(songs, page))
 
-                        playlist_name = session.get("playlist_name", "")
-                        reply_msg = f"歌单：{playlist_name}\n共有 {len(songs)} 条结果，请输入数字来获取歌曲\n"
-                        for idx, song in enumerate(songs):
-                            song_name = song.get("name", "Unknown")
-                            artists = song.get("artists") or song.get("ar") or song.get("artist") or []
-                            artist_names = "/".join([a.get("name", "") for a in artists if isinstance(a, dict)])
-                            line = f"{idx + 1}. {song_name} - {artist_names}"
-                            reply_msg += f"{line}\n"
-                        reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
+                reply = await event.wait_reply(timeout=120)
+                if reply is None:
+                    await event.reply("选择超时，已取消")
+                    break
 
-                        adapter_instance = getattr(sdk.adapter, session.get("platform", "yunhu"), sdk.adapter.yunhu)
-                        if adapter_instance:
-                            await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Text(reply_msg)
-
-                        session["songs"] = songs
-                        session["state"] = "selecting"
-                        session["mode"] = "playlist_tracks"
-                        session["page"] = page
-                        return
-
-                    if msg.upper() == "N":
-                        asyncio.create_task(self._cancel_session(session_key))
-                        return
-                m = re.match(r"^列表\s*(\d+)$", msg)
-                if m:
-                    page = int(m.group(1))
-                    if page < 1:
-                        return
-
-                    keywords = session.get("keywords")
-                    limit = int(session.get("limit", 10))
-                    offset = (page - 1) * limit
-                    if mode == "playlist":
-                        if not keywords:
-                            return
-
-                        playlists = await self.get_playlist_search_results(keywords, limit=limit, offset=offset)
-                        reply_msg = f"共有 {len(playlists)} 条结果，请输入数字来获取歌单\n"
-                        for idx, pl in enumerate(playlists):
-                            pl_name = pl.get("name", "Unknown")
-                            creator = pl.get("creator") or {}
-                            nickname = creator.get("nickname", "") if isinstance(creator, dict) else ""
-                            track_count = pl.get("trackCount")
-                            track_count_str = str(track_count) if isinstance(track_count, int) else ""
-                            line = f"{idx + 1}. {pl_name} - {nickname} {track_count_str}".strip()
-                            reply_msg += f"{line}\n"
-                        reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
-
-                        adapter_instance = getattr(sdk.adapter, session.get("platform", "yunhu"), sdk.adapter.yunhu)
-                        if adapter_instance:
-                            await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Text(reply_msg)
-
-                        session["playlists"] = playlists
-                        session["page"] = page
-                        return
-
-                    if mode == "playlist_tracks":
-                        playlist_id = session.get("playlist_id")
-                        if not playlist_id:
-                            return
-                        songs = await self.get_playlist_tracks(int(playlist_id), limit=limit, offset=offset)
-                        playlist_name = session.get("playlist_name", "")
-                        reply_msg = f"歌单：{playlist_name}\n共有 {len(songs)} 条结果，请输入数字来获取歌曲\n"
-                        for idx, song in enumerate(songs):
-                            song_name = song.get("name", "Unknown")
-                            artists = song.get("artists") or song.get("ar") or song.get("artist") or []
-                            artist_names = "/".join([a.get("name", "") for a in artists if isinstance(a, dict)])
-                            line = f"{idx + 1}. {song_name} - {artist_names}"
-                            reply_msg += f"{line}\n"
-                        reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
-
-                        adapter_instance = getattr(sdk.adapter, session.get("platform", "yunhu"), sdk.adapter.yunhu)
-                        if adapter_instance:
-                            await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Text(reply_msg)
-
-                        session["songs"] = songs
-                        session["page"] = page
-                        return
-
-                    # default: song mode
-                    if not keywords:
-                        return
-
-                    songs = await self.get_search_results(keywords, limit=limit, offset=offset)
-                    reply_msg = f"共有 {len(songs)} 条结果，请输入数字来获取歌曲\n"
-                    for idx, song in enumerate(songs):
-                        song_name = song.get("name", "Unknown")
-                        artists = song.get("artists") or song.get("ar") or song.get("artist") or []
-                        artist_names = "/".join([a.get("name", "") for a in artists if isinstance(a, dict)])
-                        line = f"{idx + 1}. {song_name} - {artist_names}"
-                        reply_msg += f"{line}\n"
-                    reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
-
-                    adapter_instance = getattr(sdk.adapter, session.get("platform", "yunhu"), sdk.adapter.yunhu)
-                    if adapter_instance:
-                        await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Text(reply_msg)
-
-                    session["songs"] = songs
-                    session["page"] = page
-                    return
+                msg = reply.get_text().strip()
+                page_match = re.match(r"^列表\s*(\d+)$", msg)
+                if page_match:
+                    page = int(page_match.group(1))
+                    offset = (page - 1) * self._search_limit
+                    continue
 
                 if msg.isdigit():
                     choice = int(msg)
-                    if mode == "playlist":
-                        playlists = session.get("playlists") or []
-                        if 1 <= choice <= len(playlists):
-                            selected = playlists[choice - 1]
-                            playlist_id = selected.get("id")
-                            if not playlist_id:
-                                return
-
-                            detail = await self.get_playlist_detail(int(playlist_id))
-
-                            name = detail.get("name") or selected.get("name") or ""
-                            creator = detail.get("creator") or selected.get("creator") or {}
-                            nickname = creator.get("nickname", "") if isinstance(creator, dict) else ""
-                            creator_id = creator.get("userId") if isinstance(creator, dict) else ""
-                            create_time = detail.get("createTime")
-                            try:
-                                create_time_str = datetime.fromtimestamp(int(create_time) / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
-                            except Exception:
-                                create_time_str = ""
-                            cover_url = detail.get("coverImgUrl") or selected.get("coverImgUrl") or ""
-
-                            md = (
-                                f"歌单id：{playlist_id}\n\n"
-                                f"歌单名称：{name}\n\n"
-                                f"创建时间：{create_time_str}\n\n"
-                                f"创建用户：{nickname}\n\n"
-                                f"用户id：{creator_id}\n\n"
-                                f"歌单封面：\n\n"
-                                f"![]({cover_url})\n\n"
-                                f"是否要查看歌单内歌曲？（Y/N）"
-                            )
-
-                            adapter_instance = getattr(sdk.adapter, session.get("platform", "yunhu"), sdk.adapter.yunhu)
-                            if adapter_instance and hasattr(adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")), "Markdown"):
-                                await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Markdown(md)
-                            elif adapter_instance:
-                                await adapter_instance.Send.To(session.get("detail_type", "user"), session.get("target_id")).Text(md)
-
-                            session["state"] = "playlist_confirm_tracks"
-                            session["playlist_id"] = int(playlist_id)
-                            session["playlist_name"] = name
-                            return
-                        return
-
-                    songs = session.get("songs", [])
                     if 1 <= choice <= len(songs):
-                        selected_song = songs[choice - 1]
-                        asyncio.create_task(self.process_selection(event, selected_song, session))
-                        asyncio.create_task(self._cancel_session(session_key))
+                        selected = songs[choice - 1]
+                        song_id = selected.get("id")
+                        song_name = selected.get("name", "未知")
+                        await event.reply(await self._format_song_detail(song_id, selected))
+                        await self._send_audio(event, song_id, song_name)
+                        break
                     else:
-                        pass
+                        await event.reply(f"无效选择，请输入 1-{len(songs)} 之间的数字")
+                        continue
+                else:
+                    break
         except Exception as e:
-             sdk.logger.error(f"Error in handle_message: {e}")
+            self.logger.error(f"点歌处理失败: {e}")
+            await event.reply("处理失败，请稍后重试")
 
-    # Listen for the specific command webhook/event
-    # Since the exact event type for "webhook command 2241" is platform specific and likely passed through 
-    # ErisPulse as a raw event or a specific message type, we'll try to catch it via a global event listener
-    # and check the command ID.
-    async def handle_any_event(self, event: Dict[str, Any]):
-        # Check for Yunhu specific command structure
-        if "yunhu_command" in event:
-            sdk.logger.info(f"Received Yunhu command event: {event.get('yunhu_command')}")
-            cmd = event["yunhu_command"]
-            if str(cmd.get("id")) == "2241":
-                await self.process_command_2241(event)
-                return
-            if str(cmd.get("id")) == "2269":
-                await self.process_command_2269(event)
+    async def _handle_playlist(self, event):
+        try:
+            args = event.get_command_args()
+            if not args:
+                await event.reply("请输入歌单关键词，例如：/playlist 华语流行")
                 return
 
-        # Fallback to previous checks
-        try:
-            data = event.get("data", {})
-            raw_event = data if isinstance(data, dict) else event
-            
-            # Common patterns for command events
-            cid = raw_event.get("command_id") or raw_event.get("commandId")
-            
-            # If not in top level, check 'data' subfield if it exists
-            if not cid and "data" in raw_event and isinstance(raw_event["data"], dict):
-                cid = raw_event["data"].get("command_id") or raw_event["data"].get("commandId")
+            keywords = " ".join(args)
+            await event.reply(f"正在搜索歌单：{keywords}...")
 
-            if str(cid) == "2241":
-                await self.process_command_2241(raw_event)
-            if str(cid) == "2269":
-                await self.process_command_2269(raw_event)
+            playlists = await self._search_playlists(keywords)
+            if not playlists:
+                await event.reply("未找到相关歌单")
+                return
+
+            page = 1
+            offset = 0
+            while True:
+                if page > 1:
+                    playlists = await self._search_playlists(keywords, offset=offset)
+                    if not playlists:
+                        await event.reply("没有更多结果了")
+                        break
+
+                await event.reply(self._format_playlist_list(playlists, page))
+
+                reply = await event.wait_reply(timeout=120)
+                if reply is None:
+                    await event.reply("选择超时，已取消")
+                    break
+
+                msg = reply.get_text().strip()
+                page_match = re.match(r"^列表\s*(\d+)$", msg)
+                if page_match:
+                    page = int(page_match.group(1))
+                    offset = (page - 1) * self._search_limit
+                    continue
+
+                if msg.isdigit():
+                    choice = int(msg)
+                    if 1 <= choice <= len(playlists):
+                        await self._handle_playlist_selected(event, playlists[choice - 1])
+                        break
+                    else:
+                        await event.reply(f"无效选择，请输入 1-{len(playlists)}")
+                        continue
+                else:
+                    break
         except Exception as e:
-            # Don't log spam for every event
-            pass
+            self.logger.error(f"歌单处理失败: {e}")
+            await event.reply("处理失败，请稍后重试")
 
-    async def process_command_2269(self, event):
-        user_id = event.get("user_id") or event.get("sender", {}).get("user_id")
-
-        keywords = ""
-        if "yunhu_command" in event:
-            keywords = event["yunhu_command"].get("args", "")
-
-        if not keywords:
-            if "message" in event:
-                if isinstance(event["message"], str):
-                    keywords = event["message"]
-                elif isinstance(event["message"], list):
-                    for seg in event["message"]:
-                        if seg.get("type") == "text":
-                            keywords += seg.get("data", {}).get("text", "")
-
-        if not keywords and "params" in event:
-            keywords = event["params"]
-
-        if not keywords:
-            keywords = event.get("raw_message", "")
-
-        sdk.logger.info(f"Received playlist search command for: {keywords}")
-
-        limit = 30
-        page = 1
-        playlists = await self.get_playlist_search_results(keywords, limit=limit, offset=0)
-
-        reply_msg = f"共有 {len(playlists)} 条结果，请输入数字来获取歌单\n"
-        for idx, pl in enumerate(playlists):
-            pl_name = pl.get("name", "Unknown")
-            creator = pl.get("creator") or {}
-            nickname = creator.get("nickname", "") if isinstance(creator, dict) else ""
-            track_count = pl.get("trackCount")
-            track_count_str = str(track_count) if isinstance(track_count, int) else ""
-            line = f"{idx + 1}. {pl_name} - {nickname} {track_count_str}".strip()
-            reply_msg += f"{line}\n"
-        reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
-
-        platform = "yunhu"
-        if "platform" in event:
-            platform = event["platform"]
-
-        adapter_instance = getattr(sdk.adapter, platform, None)
-        if not adapter_instance:
-            adapter_instance = sdk.adapter.yunhu
-
-        detail_type = "user"
-        target_id = user_id
-        if "group_id" in event and event["group_id"]:
-            detail_type = "group"
-            target_id = event["group_id"]
-
-        if adapter_instance:
-            await adapter_instance.Send.To(detail_type, target_id).Text(reply_msg)
-
-        session_key = Main._session_key({"platform": platform, "group_id": event.get("group_id")}, user_id)
-        await self._cancel_session(session_key)
-
-        Main.user_sessions[session_key] = {
-            "playlists": playlists,
-            "state": "selecting",
-            "mode": "playlist",
-            "keywords": keywords,
-            "limit": limit,
-            "page": page,
-            "platform": platform,
-            "detail_type": detail_type,
-            "target_id": target_id,
-        }
-
-    async def process_command_2241(self, event):
-        user_id = event.get("user_id") or event.get("sender", {}).get("user_id")
-        
-        keywords = ""
-        # Prefer Yunhu command args if available
-        if "yunhu_command" in event:
-            keywords = event["yunhu_command"].get("args", "")
-        
-        # Fallback extraction logic
-        if not keywords:
-            if "message" in event:
-                 if isinstance(event["message"], str):
-                     keywords = event["message"]
-                 elif isinstance(event["message"], list):
-                     for seg in event["message"]:
-                         if seg.get("type") == "text":
-                             keywords += seg.get("data", {}).get("text", "")
-        
-        # Fallback if empty, maybe it's in a specific field for slash commands
-        if not keywords and "params" in event:
-             keywords = event["params"]
-
-        if not keywords:
-            # Try getting from raw command text if simple message
-            keywords = event.get("raw_message", "")
-
-        sdk.logger.info(f"Received search command for: {keywords}")
-
-        limit = 30
-        page = 1
-        songs = await self.get_search_results(keywords, limit=limit, offset=0)
-        
-        reply_msg = f"共有 {len(songs)} 条结果，请输入数字来获取歌曲\n"
-        for idx, song in enumerate(songs):
-            song_name = song.get("name", "Unknown")
-            # Artist Handling
-            artists = song.get("artists") or song.get("ar") or song.get("artist") or []
-            artist_names = "/".join([a.get("name", "") for a in artists])
-            
-            line = f"{idx + 1}. {song_name} - {artist_names}"
-            reply_msg += f"{line}\n"
-
-        reply_msg += "\n发送'列表 N'（N为阿拉伯数字）来获取更多结果"
-
-        # Send response
-        platform = "yunhu" # Triggered by Yunhu command 2241 likely
-        # But we should use the platform from event if available
-        if "platform" in event:
-            platform = event["platform"]
-            
-        adapter_instance = getattr(sdk.adapter, platform, None)
-        # Fallback to yunhu if not found (since config has yunhu)
-        if not adapter_instance:
-             adapter_instance = sdk.adapter.yunhu
-
-        # Determine target type and id
-        detail_type = "user"
-        target_id = user_id
-        if "group_id" in event and event["group_id"]:
-            detail_type = "group"
-            target_id = event["group_id"]
-        
-        if adapter_instance:
-            await adapter_instance.Send.To(detail_type, target_id).Text(reply_msg)
-
-        # Save state (scoped by platform + conversation + user)
-        session_key = Main._session_key({"platform": platform, "group_id": event.get("group_id")}, user_id)
-        await self._cancel_session(session_key)
-
-        Main.user_sessions[session_key] = {
-            "songs": songs,
-            "state": "selecting",
-            "keywords": keywords,
-            "limit": limit,
-            "page": page,
-            "platform": platform,
-            "detail_type": detail_type,
-            "target_id": target_id,
-        }
-
-    async def process_selection(self, event, song, session_context=None):
-        song_id = song.get("id")
-        duration = song.get("duration", 0)
-        
-        # Resolve context
-        user_id = event.get("user_id")
-        if session_context is None:
-             session_key = Main._session_key(event, user_id)
-             session_context = Main.user_sessions.get(session_key, {})
-             
-        platform = session_context.get("platform", "yunhu")
-        detail_type = session_context.get("detail_type", "user")
-        target_id = session_context.get("target_id", user_id)
-        
-        adapter_instance = getattr(sdk.adapter, platform, sdk.adapter.yunhu)
-
+    async def _handle_playlist_selected(self, event, selected: dict):
         try:
-            detail = await self.get_song_detail(song_id)
-            comment_total = await self.get_comment_total(song_id)
+            playlist_id = selected.get("id")
+            if not playlist_id:
+                await event.reply("歌单信息异常")
+                return
 
-            name = detail.get("name") or song.get("name") or ""
-            main_title = detail.get("mainTitle") or ""
+            detail = await self._get_playlist_detail(int(playlist_id))
+            if detail:
+                await event.reply(self._format_playlist_detail(detail))
+            else:
+                await event.reply(f"歌单：{selected.get('name', '未知')}\n\n回复 Y 查看歌曲，N 取消")
 
-            artists = detail.get("ar") or detail.get("artists") or song.get("artists") or song.get("ar") or []
-            artist_names = "/ ".join([a.get("name", "") for a in artists if isinstance(a, dict)])
+            confirm = await event.wait_reply(timeout=60)
+            if confirm is None:
+                await event.reply("操作超时")
+                return
 
-            album = detail.get("al") or detail.get("album") or {}
-            album_name = album.get("name", "") if isinstance(album, dict) else ""
-            cover_url = album.get("picUrl", "") if isinstance(album, dict) else ""
+            if confirm.get_text().strip().upper() != "Y":
+                await event.reply("已取消")
+                return
 
-            pop = detail.get("pop")
-            pop_str = str(int(pop)) if isinstance(pop, (int, float)) else ""
+            playlist_name = detail.get("name") or selected.get("name", "")
+            tracks = await self._get_playlist_tracks(int(playlist_id))
+            if not tracks:
+                await event.reply("无法获取歌单曲目")
+                return
 
-            md = (
-                f"歌名：{name}\n\n"
-                f"主标题：{main_title}\n\n"
-                f"歌手：{artist_names}\n\n"
-                f"所属专辑：{album_name}\n\n"
-                f"歌曲热度：{pop_str}\n\n"
-                f"评论 {comment_total}\n\n"
-                f"歌曲封面：\n\n"
-                f"![]({cover_url})\n\n"
-            )
+            track_page = 1
+            track_offset = 0
+            while True:
+                if track_page > 1:
+                    tracks = await self._get_playlist_tracks(int(playlist_id), offset=track_offset)
+                    if not tracks:
+                        await event.reply("没有更多歌曲了")
+                        break
 
-            if adapter_instance and hasattr(adapter_instance.Send.To(detail_type, target_id), "Markdown"):
-                await adapter_instance.Send.To(detail_type, target_id).Markdown(md)
-            elif adapter_instance:
-                await adapter_instance.Send.To(detail_type, target_id).Text(md)
+                track_text = f"歌单：{playlist_name}\n共 {len(tracks)} 首（第 {track_page} 页），请回复数字选择歌曲\n\n"
+                for i, song in enumerate(tracks, 1):
+                    name = song.get("name", "未知")
+                    artists = song.get("artists") or song.get("ar") or []
+                    track_text += f"{i}. {name} - {self._format_artist_names(artists)}\n"
+                track_text += "\n回复 \"列表 N\" 翻页"
+
+                await event.reply(track_text)
+
+                track_reply = await event.wait_reply(timeout=120)
+                if track_reply is None:
+                    await event.reply("选择超时，已取消")
+                    break
+
+                track_msg = track_reply.get_text().strip()
+                tp_match = re.match(r"^列表\s*(\d+)$", track_msg)
+                if tp_match:
+                    track_page = int(tp_match.group(1))
+                    track_offset = (track_page - 1) * self._search_limit
+                    continue
+
+                if track_msg.isdigit():
+                    tc = int(track_msg)
+                    if 1 <= tc <= len(tracks):
+                        song = tracks[tc - 1]
+                        song_id = song.get("id")
+                        song_name = song.get("name", "未知")
+                        await event.reply(await self._format_song_detail(song_id, song))
+                        await self._send_audio(event, song_id, song_name)
+                        break
+                    else:
+                        await event.reply(f"无效选择，请输入 1-{len(tracks)}")
+                        continue
+                else:
+                    break
         except Exception as e:
-            sdk.logger.error(f"Failed to fetch/send song detail: {e}")
-        
-        url = await self.get_song_url(song_id)
-        if not url:
-            sdk.logger.error("Failed to get song URL")
-            if adapter_instance:
-                 await adapter_instance.Send.To(detail_type, target_id).Text("获取失败")
-            return
-
-        # Download
-        temp_audio = f"temp_{song_id}.mp3"
-        temp_video = f"temp_{song_id}.mp4"
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        with open(temp_audio, 'wb') as f:
-                            f.write(await resp.read())
-            
-            # Generate Video
-            await self.generate_video_from_audio(temp_audio, temp_video, duration)
-
-            # Upload ... (rest of logic)
-            
-            # Upload
-            user_id = event.get("user_id")
-            platform = session_context.get("platform", platform)
-            detail_type = session_context.get("detail_type", detail_type)
-            target_id = session_context.get("target_id", target_id)
-            adapter_instance = getattr(sdk.adapter, platform, sdk.adapter.yunhu)
-            
-            if adapter_instance:
-                 # Check if adapter has Video upload method. Usually .Video or .File
-                 
-                 # Prepare filename
-                 filename = os.path.basename(temp_video)
-                 
-                
-                 # Manual video upload using specific API endpoint provided by user
-                 # URL: https://chat-go.jwzhd.com/open-apis/v1/video/upload?token=...
-                 
-                 token = getattr(adapter_instance, "yhToken", None)
-                 if not token:
-                     sdk.logger.error("Could not find Yunhu token on adapter instance.")
-                     raise Exception("Yunhu token not found")
-
-                 upload_url = f"https://chat-go.jwzhd.com/open-apis/v1/video/upload?token={token}"
-                 video_key = None
-                 
-                 sdk.logger.info(f"Uploading video to {upload_url}")
-                 
-                 async with aiohttp.ClientSession() as session:
-                     with open(temp_video, 'rb') as f:
-                         data = aiohttp.FormData()
-                         data.add_field('video', f, filename=filename, content_type='video/mp4')
-                         
-                         async with session.post(upload_url, data=data) as resp:
-                             resp_text = await resp.text()
-                             sdk.logger.info(f"Upload response: {resp_text}")
-                             try:
-                                 resp_json = json.loads(resp_text)
-                                 # User provided example: {"code": 1, "data": {"videoKey": "xxx"}, "msg": "success"}
-                                 if resp_json.get("code") == 1 and "data" in resp_json:
-                                     video_key = resp_json["data"].get("videoKey")
-                             except Exception as json_err:
-                                 sdk.logger.error(f"Failed to parse upload response: {json_err}")
-
-                 if video_key:
-                     sdk.logger.info(f"Video uploaded successfully. Key: {video_key}")
-                     # 2. Send Message with contentType='video' and videoKey
-                     await adapter_instance.call_api(
-                         "/bot/send",
-                         recvId=target_id,
-                         recvType=detail_type,
-                         contentType="video",
-                         content={
-                             "videoKey": video_key
-                         }
-                     )
-                 else:
-                     raise Exception(f"Failed to upload video (no videoKey returned). Response: {resp_text}")
-
-        except Exception as e:
-            sdk.logger.error(f"Process selection failed: {e}")
-        finally:
-            # Cleanup
-            if os.path.exists(temp_audio):
-                os.remove(temp_audio)
-            if os.path.exists(temp_video):
-                os.remove(temp_video)
-
+            self.logger.error(f"歌单详情处理失败: {e}")
+            await event.reply("处理失败，请稍后重试")

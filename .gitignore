@@ -1,5 +1,9 @@
 build/
 config/
-ErisPulse_MusicBot.egg-info/
-
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.db
+.env
 config.toml

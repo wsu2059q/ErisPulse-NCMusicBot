@@ -1,17 +1,14 @@
 [project]
-name = "ErisPulse-MusicBot"
-version = "1.0.0"
-description = "基于ErisPulse SDK + YunhuAdapter 的音乐机器人"
+name = "ErisPulse-NCMusicBot"
+version = "2.0.0"
+description = "基于 ErisPulse SDK 的网易云音乐点歌模块"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [ { name = "MusicBot", email = "dev@example.com" } ]
+authors = [ { name = "NCMusicBot", email = "dev@example.com" } ]
 dependencies = [
   "ErisPulse>=2.3.0",
-  "ErisPulse-YunhuAdapter",
   "aiohttp>=3.8.0",
-  "ffmpeg-python>=0.2.0",
-  "Pillow>=10.0.0"
 ]
 
 [project.entry-points."erispulse.module"]
